@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.OpenSubtitles.Configuration;
@@ -28,6 +29,8 @@ namespace Jellyfin.Plugin.OpenSubtitles
         private readonly IFileSystem _fileSystem;
         private DateTime _lastRateLimitException;
         private DateTime _lastLogin;
+        private DateTime _lastSoftRateLimit;
+        private int _rateLimitLeft = 40;
 
         public OpenSubtitleDownloader(ILogger<OpenSubtitleDownloader> logger, IFileSystem fileSystem, IHttpClient httpClient)
         {
@@ -73,21 +76,56 @@ namespace Jellyfin.Plugin.OpenSubtitles
             {
                 throw new RateLimitExceededException("OpenSubtitles rate limit reached");
             }
-
-            var resultDownLoad = await OpenSubtitlesHandler.OpenSubtitles.DownloadSubtitlesAsync(downloadsList, cancellationToken).ConfigureAwait(false);
-
-            if ((resultDownLoad.Status ?? string.Empty).IndexOf("407", StringComparison.OrdinalIgnoreCase) != -1)
+            if ((DateTime.UtcNow - _lastSoftRateLimit).TotalSeconds < 40)
             {
-                _lastRateLimitException = DateTime.UtcNow;
-                throw new RateLimitExceededException("OpenSubtitles rate limit reached");
+                await Task.Delay((DateTime.UtcNow - _lastSoftRateLimit), cancellationToken);
             }
+            bool validResponse = false;
+            IMethodResponse downloadResult = null;
+            while (!validResponse)
+            {
+                validResponse = true;
+                if (_rateLimitLeft == 0)
+                {
+                    await Task.Delay(500);
+                }
+                HttpStatusCode[] allowedStatusCodes = { (HttpStatusCode)429, (HttpStatusCode)407 };
+                var downloadResponse = await OpenSubtitlesHandler.OpenSubtitles.DownloadSubtitlesAsync(downloadsList, cancellationToken, allowedStatusCodes).ConfigureAwait(false);
+                downloadResult = downloadResponse.Item1;
 
-            if (!(resultDownLoad is MethodResponseSubtitleDownload))
+                _rateLimitLeft = downloadResponse.Item2 == null ? _rateLimitLeft : (int)downloadResponse.Item2;
+                if (downloadResponse.Item2 != null)
+                {
+                    if (_rateLimitLeft <= 4)
+                    {
+                        await Task.Delay(250);
+                    }
+                }
+
+                if ((int)downloadResponse.Item3 == 407 || (downloadResult.Status ?? string.Empty).IndexOf("407", StringComparison.OrdinalIgnoreCase) != -1)
+                {
+                    _lastRateLimitException = DateTime.UtcNow;
+                    throw new RateLimitExceededException("OpenSubtitles daily limit reached");
+                }
+                else if ((int)downloadResponse.Item3 == 429 || (downloadResult.Status ?? string.Empty).IndexOf("429", StringComparison.OrdinalIgnoreCase) != -1)
+                {
+                    _lastSoftRateLimit = DateTime.UtcNow;
+                    _rateLimitLeft = 0;
+                    validResponse = false;
+                }
+                else if (!(downloadResult is MethodResponseSubtitleDownload))
+                {
+                    throw new Exception("Invalid response type");
+                }
+                _logger.LogDebug("valid result: {0}", validResponse ? "yes" : "no");
+            }
+            // This should never happen
+            if (downloadResult == null)
             {
                 throw new Exception("Invalid response type");
             }
 
-            var results = ((MethodResponseSubtitleDownload)resultDownLoad).Results;
+            var results = ((MethodResponseSubtitleDownload)downloadResult).Results;
 
             _lastRateLimitException = DateTime.MinValue;
 
@@ -95,9 +133,9 @@ namespace Jellyfin.Plugin.OpenSubtitles
             {
                 var msg = string.Format("Subtitle with Id {0} was not found. Name: {1}. Status: {2}. Message: {3}",
                     ossId,
-                    resultDownLoad.Name ?? string.Empty,
-                    resultDownLoad.Status ?? string.Empty,
-                    resultDownLoad.Message ?? string.Empty);
+                    downloadResult.Name ?? string.Empty,
+                    downloadResult.Status ?? string.Empty,
+                    downloadResult.Message ?? string.Empty);
 
                 throw new ResourceNotFoundException(msg);
             }
@@ -129,11 +167,19 @@ namespace Jellyfin.Plugin.OpenSubtitles
 
             var loginResponse = await OpenSubtitlesHandler.OpenSubtitles.LogInAsync(options.Username, options.Password, "en", cancellationToken).ConfigureAwait(false);
 
-            if (!(loginResponse is MethodResponseLogIn))
+            _logger.LogDebug("Login");
+            if (loginResponse.Item2 != null)
+            {
+                if (loginResponse.Item2 == 1)
+                {
+                    await Task.Delay(1000);
+                }
+            }
+            if (!(loginResponse.Item1 is MethodResponseLogIn))
             {
                 throw new Exception("Authentication to OpenSubtitles failed.");
             }
-
+            _rateLimitLeft = loginResponse.Item2 == null ? _rateLimitLeft : (int)loginResponse.Item2;
             _lastLogin = DateTime.UtcNow;
         }
 
@@ -233,8 +279,43 @@ namespace Jellyfin.Plugin.OpenSubtitles
                                                                    imdbid: searchImdbId ),
                                                            };
             parms.AddRange(subtitleSearchParameters);
-            var result = await OpenSubtitlesHandler.OpenSubtitles.SearchSubtitlesAsync(parms.ToArray(), cancellationToken).ConfigureAwait(false);
-            if (!(result is MethodResponseSubtitleSearch))
+
+            bool validResponse = false;
+            IMethodResponse searchResult = null;
+            while (!validResponse)
+            {
+                validResponse = true;
+                if (_rateLimitLeft == 0)
+                {
+                    await Task.Delay(500);
+                }
+                HttpStatusCode[] allowedStatusCodes = { (HttpStatusCode)429 };
+                var searchResponse = await OpenSubtitlesHandler.OpenSubtitles.SearchSubtitlesAsync(parms.ToArray(), cancellationToken, allowedStatusCodes).ConfigureAwait(false);
+
+                searchResult = searchResponse.Item1;
+                _rateLimitLeft = searchResponse.Item2 ?? _rateLimitLeft;
+                if (searchResponse.Item2 != null)
+                {
+                    if (_rateLimitLeft <= 4)
+                    {
+                        await Task.Delay(250);
+                    }
+                }
+
+                if ((int)searchResponse.Item3 == 429 || (searchResult.Status ?? string.Empty).IndexOf("429", StringComparison.OrdinalIgnoreCase) != -1)
+                {
+                    _lastSoftRateLimit = DateTime.UtcNow;
+                    _rateLimitLeft = 0;
+                    validResponse = false;
+                }
+                else if (!(searchResult is MethodResponseSubtitleSearch))
+                {
+                    _logger.LogError("Invalid response type");
+                    return Enumerable.Empty<RemoteSubtitleInfo>();
+                }
+            }
+            // This should never happen
+            if (searchResult == null)
             {
                 _logger.LogError("Invalid response type");
                 return Enumerable.Empty<RemoteSubtitleInfo>();
@@ -248,7 +329,7 @@ namespace Jellyfin.Plugin.OpenSubtitles
                           int.Parse(x.SeriesEpisode, _usCulture) == request.IndexNumber
                         : !string.IsNullOrEmpty(x.IDMovieImdb) && long.Parse(x.IDMovieImdb, _usCulture) == imdbId;
 
-            var results = ((MethodResponseSubtitleSearch)result).Results;
+            var results = ((MethodResponseSubtitleSearch)searchResult).Results;
 
             // Avoid implicitly captured closure
             var hasCopy = hash;

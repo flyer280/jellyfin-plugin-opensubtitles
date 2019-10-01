@@ -20,6 +20,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -102,7 +103,7 @@ namespace OpenSubtitlesHandler
             return new MethodResponseError("Fail", "Log in failed !");
         }
 
-        public static async Task<IMethodResponse> LogInAsync(string username, string password, string language, CancellationToken cancellationToken)
+        public static async Task<(IMethodResponse, int?)> LogInAsync(string username, string password, string language, CancellationToken cancellationToken)
         {
             // Method call ..
             var parms = new List<IXmlRpcValue>();
@@ -115,12 +116,12 @@ namespace OpenSubtitlesHandler
 
             //File.WriteAllText(".\\request.txt", Encoding.UTF8.GetString(XmlRpcGenerator.Generate(call)));
             // Send the request to the server
-            var stream = await Utilities.SendRequestAsync(XmlRpcGenerator.Generate(call), XML_PRC_USERAGENT, cancellationToken)
+            var httpResponse = await Utilities.SendRequestAsync(XmlRpcGenerator.Generate(call), XML_PRC_USERAGENT, cancellationToken)
                 .ConfigureAwait(false);
 
-            string response = Utilities.GetStreamString(stream);
+            string response = Utilities.GetStreamString(httpResponse.Item1);
 
-            if (!response.Contains("ERROR:"))
+            if (!response.Contains("ERROR:") && ((int)httpResponse.Item3 != 429))
             {
                 // No error occur, get and decode the response. We expect Struct here.
                 XmlRpcMethodCall[] calls = XmlRpcGenerator.DecodeMethodResponse(response);
@@ -148,16 +149,16 @@ namespace OpenSubtitlesHandler
                                     break;
                             }
                         }
-                        return re;
+                        return (re, httpResponse.Item2);
                     }
                 }
             }
             else
             {
                 OSHConsole.WriteLine(response, DebugCode.Error);
-                return new MethodResponseError("Fail", response);
+                return (new MethodResponseError("Fail", response), httpResponse.Item2);
             }
-            return new MethodResponseError("Fail", "Log in failed !");
+            return (new MethodResponseError("Fail", "Log in failed !"), null);
         }
 
         /// <summary>
@@ -470,24 +471,24 @@ namespace OpenSubtitlesHandler
             return new MethodResponseError("Fail", "Search Subtitles call failed !");
         }
 
-        public static async Task<IMethodResponse> SearchSubtitlesAsync(SubtitleSearchParameters[] parameters, CancellationToken cancellationToken)
+        public static async Task<(IMethodResponse, int?, HttpStatusCode?)> SearchSubtitlesAsync(SubtitleSearchParameters[] parameters, CancellationToken cancellationToken, HttpStatusCode[] allowedStatusCodes = null)
         {
             if (TOKEN.Length == 0)
             {
                 OSHConsole.WriteLine("Can't do this call, 'token' value not set. Please use Log In method first.", DebugCode.Error);
-                return new MethodResponseError("Fail", "Can't do this call, 'token' value not set. Please use Log In method first.");
+                return (new MethodResponseError("Fail", "Can't do this call, 'token' value not set. Please use Log In method first."), null, null);
             }
 
             if (parameters == null)
             {
                 OSHConsole.UpdateLine("No subtitle search parameter passed !!", DebugCode.Error);
-                return new MethodResponseError("Fail", "No subtitle search parameter passed");
+                return (new MethodResponseError("Fail", "No subtitle search parameter passed"), null, null);
             }
 
             if (parameters.Length == 0)
             {
                 OSHConsole.UpdateLine("No subtitle search parameter passed !!", DebugCode.Error);
-                return new MethodResponseError("Fail", "No subtitle search parameter passed");
+                return (new MethodResponseError("Fail", "No subtitle search parameter passed"), null, null);
             }
 
             var parms = new List<IXmlRpcValue>()
@@ -550,9 +551,11 @@ namespace OpenSubtitlesHandler
             var call = new XmlRpcMethodCall("SearchSubtitles", parms);
             OSHConsole.WriteLine("Sending SearchSubtitles request to the server ...", DebugCode.Good);
             // Send the request to the server
-            string response = Utilities.GetStreamString(await Utilities.SendRequestAsync(XmlRpcGenerator.Generate(call), XML_PRC_USERAGENT, cancellationToken).ConfigureAwait(false));
+            var httpResult = await Utilities.SendRequestAsync(XmlRpcGenerator.Generate(call), XML_PRC_USERAGENT, cancellationToken, allowedStatusCodes).ConfigureAwait(false);
 
-            if (!response.Contains("ERROR:"))
+            string response = Utilities.GetStreamString(httpResult.Item1);
+
+            if (!response.Contains("ERROR:") && ((int)httpResult.Item3 != 429))
             {
                 // No error occur, get and decode the response.
                 XmlRpcMethodCall[] calls = XmlRpcGenerator.DecodeMethodResponse(response);
@@ -645,17 +648,17 @@ namespace OpenSubtitlesHandler
                         }
 
                         // Return the response to user !!
-                        return R;
+                        return (R, httpResult.Item2, httpResult.Item3);
                     }
                 }
             }
             else
             {
                 OSHConsole.WriteLine(response, DebugCode.Error);
-                return new MethodResponseError("Fail", response);
+                return (new MethodResponseError("Fail", response), httpResult.Item2, httpResult.Item3);
             }
 
-            return new MethodResponseError("Fail", "Search Subtitles call failed !");
+            return (new MethodResponseError("Fail", "Search Subtitles call failed !"), null, null);
         }
 
         /// <summary>
@@ -775,24 +778,24 @@ namespace OpenSubtitlesHandler
             return new MethodResponseError("Fail", "DownloadSubtitles call failed !");
         }
 
-        public static async Task<IMethodResponse> DownloadSubtitlesAsync(int[] subIDS, CancellationToken cancellationToken)
+        public static async Task<(IMethodResponse, int?, HttpStatusCode?)> DownloadSubtitlesAsync(int[] subIDS, CancellationToken cancellationToken, HttpStatusCode[] allowedStatusCodes)
         {
             if (TOKEN.Length == 0)
             {
                 OSHConsole.WriteLine("Can't do this call, 'token' value not set. Please use Log In method first.", DebugCode.Error);
-                return new MethodResponseError("Fail", "Can't do this call, 'token' value not set. Please use Log In method first.");
+                return (new MethodResponseError("Fail", "Can't do this call, 'token' value not set. Please use Log In method first."), null, null);
             }
 
             if (subIDS == null)
             {
                 OSHConsole.UpdateLine("No subtitle id passed !!", DebugCode.Error);
-                return new MethodResponseError("Fail", "No subtitle id passed");
+                return (new MethodResponseError("Fail", "No subtitle id passed"), null, null);
             }
 
             if (subIDS.Length == 0)
             {
                 OSHConsole.UpdateLine("No subtitle id passed !!", DebugCode.Error);
-                return new MethodResponseError("Fail", "No subtitle id passed");
+                return (new MethodResponseError("Fail", "No subtitle id passed"), null, null);
             }
 
             var parms = new List<IXmlRpcValue>()
@@ -811,11 +814,10 @@ namespace OpenSubtitlesHandler
             var call = new XmlRpcMethodCall("DownloadSubtitles", parms);
             OSHConsole.WriteLine("Sending DownloadSubtitles request to the server ...", DebugCode.Good);
             // Send the request to the server
+            var httpResponse = await Utilities.SendRequestAsync(XmlRpcGenerator.Generate(call), XML_PRC_USERAGENT, cancellationToken, allowedStatusCodes).ConfigureAwait(false);
 
-            var httpResponse = await Utilities.SendRequestAsync(XmlRpcGenerator.Generate(call), XML_PRC_USERAGENT, cancellationToken).ConfigureAwait(false);
-
-            string response = Utilities.GetStreamString(httpResponse);
-            if (!response.Contains("ERROR:"))
+            string response = Utilities.GetStreamString(httpResponse.Item1);
+            if (!response.Contains("ERROR:") && (!Array.Exists(allowedStatusCodes, element => (int)element == (int)httpResponse.Item3)))
             {
                 // No error occur, get and decode the response.
                 XmlRpcMethodCall[] calls = XmlRpcGenerator.DecodeMethodResponse(response);
@@ -880,17 +882,17 @@ namespace OpenSubtitlesHandler
                         }
 
                         // Return the response to user !!
-                        return R;
+                        return (R, httpResponse.Item2, httpResponse.Item3);
                     }
                 }
             }
             else
             {
                 OSHConsole.WriteLine(response, DebugCode.Error);
-                return new MethodResponseError("Fail", response);
+                return (new MethodResponseError("Fail", response), httpResponse.Item2, httpResponse.Item3);
             }
 
-            return new MethodResponseError("Fail", "DownloadSubtitles call failed !");
+            return (new MethodResponseError("Fail", "DownloadSubtitles call failed !"), null, null);
         }
 
         /// <summary>
